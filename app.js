@@ -114,9 +114,35 @@ function drawContent(){const target=$('#content');if(!target)return;if(!snapshot
  target.innerHTML={home:homeView,schedule:scheduleView,history:historyView,requests:requestView}[tab]();
  const sc=$('#scanBtn');if(sc)sc.onclick=startScan;const upd=$('#update');if(upd)upd.onclick=async()=>{upd.disabled=true;if(tab==='requests'){lastCorrections=null;await loadCorrections();}else{await refreshSelf(true);render()}upd.disabled=false};const make=$('#newRequest');if(make)make.onclick=newCorrection;
 }
+
+function renderMonthlyProgress_(){
+ const s=snapshot.summary||{},minutes=Math.max(0,Number(s.minutes)||0),days=Math.max(0,Number(s.days)||0);
+ const norm=typeof s.normMinutes==='number'&&Number.isFinite(s.normMinutes)?Math.max(0,s.normMinutes):NaN;
+ const shifts=typeof s.plannedShifts==='number'&&Number.isFinite(s.plannedShifts)?Math.max(0,s.plannedShifts):NaN;
+ const number=x=>Number(x).toLocaleString('ru-RU',{maximumFractionDigits:1});
+ const makeCard=(title,actual,plan,actualLabel,planLabel,caption,second)=>{
+  const known=Number.isFinite(plan),pct=known&&plan>0?Math.max(0,Math.min(100,Math.round(actual/plan*100))):0;
+  const badge=known&&plan>0?Math.round(actual/plan*100)+'%':'—';
+  return '<div class="card monthMetric"><div class="row"><b>'+title+'</b><span class="monthPct">'+badge+'</span></div>'+
+    '<div class="monthNumbers"><strong>'+actualLabel+'</strong><span>из '+(known?planLabel:'—')+'</span></div>'+
+    '<div class="monthBar'+(second?' shiftBar':'')+'" role="progressbar" aria-label="'+title+'" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+pct+'"><span style="width:'+pct+'%"></span></div>'+
+    '<p class="small muted">'+caption+'</p></div>';
+ };
+ return '<div class="monthMetrics">'+
+  makeCard('Отработанные часы',minutes,norm,number(minutes/60)+' ч',number(norm/60)+' ч',Number.isFinite(norm)?'Норма часов по графику за весь месяц':'Норма появится после обновления Apps Script',false)+
+  makeCard('Завершённые смены',days,shifts,days+' смен',shifts+' по плану','Учтены только закрытые смены',true)+
+  '</div>';
+}
+function renderMonthTitle_(){
+ const key=String(snapshot.summary&&snapshot.summary.month||dateLocal().slice(0,7));
+ if(!/^\d{4}-\d{2}$/.test(key))return 'Текущий месяц';
+ return new Date(key+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'long',year:'numeric'});
+}
+
 function homeView(){const online=navigator.onLine;const open=snapshot.open;const mins=snapshot.summary?.minutes||0;const next=(snapshot.week||[]).find(x=>x.work);
  return `<section class="over"><div class="card"><div class="row"><span class="muted small">Статус смены</span><span class="chip ${open?'':'off'}">${open?'● На смене':'○ Вне смены'}</span></div><h2 style="font-size:24px;margin-top:12px">${open?'Смена началась в '+hour(open.in_at):'Отметьте приход по QR'}</h2><p class="muted small" style="margin:8px 0 20px">${open?'При уходе отсканируйте QR еще раз':'Подойдите к экрану QR на рабочем месте'}</p><button class="btn primaryAction" id="scanBtn" ${!online?'disabled':''}><span class="scanIcon">▦</span><span style="flex:1">${open?'Отметить уход':'Сканировать QR'}<div style="font-size:12px;opacity:.85;font-weight:400">Камера телефона</div></span><span>›</span></button></div></section>
- <div class="section row"><h2>Мой месяц · подтверждённые часы</h2><button class="link" id="update">Обновить ↻</button></div><div class="grid"><div class="card"><p class="small muted">Отработано</p><div class="stat">${(Number(mins)/60).toFixed(1)}<small style="font-size:13px"> ч</small></div></div><div class="card"><p class="small muted">Закрыто смен</p><div class="stat">${snapshot.summary?.days||0}</div></div></div>
+ <div class="section row"><div><h2>Мой месяц</h2><p class="small muted">${esc(renderMonthTitle_())} · по вашему графику</p></div><button class="link" id="update">Обновить ↻</button></div>
+ ${renderMonthlyProgress_()}
  <div class="section"><h2>Ближайшая смена</h2></div><div class="card">${next?`<div class="row"><div><b>${fmtDate(next.date)}</b><p class="small muted">${esc(next.schedule||'Рабочий день')}</p></div><span class="chip">${esc(next.start)} — ${esc(next.end)}</span></div>`:'<p class="muted">Рабочие дни не запланированы</p>'}</div>
  <p class="small muted" style="margin:18px 3px"><span class="dot ${online?'':'offline'}"></span>${online?'Подключение доступно':'Нет сети — отметка QR недоступна'} · История сохранена на устройстве</p>`;}
 function scheduleView(){return `<div class="section row"><h2>Мой график на 30 дней</h2><button class="link" id="update">↻</button></div><div class="card">${(snapshot.week||[]).map(s=>`<div class="day"><div class="dayDate"><b>${s.date.slice(-2)}</b><span>${new Date(s.date+'T12:00:00').toLocaleDateString('ru-RU',{weekday:'short'})}</span></div><div style="flex:1"><b>${s.work?'Рабочий день':'Выходной'}</b><p class="small muted">${s.work?esc(s.start)+' — '+esc(s.end):'Без смены'}</p></div><span class="chip ${s.work?'':'off'}">${s.work?'Смена':'Выходной'}</span></div>`).join('')||'<div class="empty">График не назначен</div>'}</div>${(snapshot.week||[]).length<30?'<p class="notice" style="margin-top:12px">Для 30 дней обновите серверный Code.gs и опубликуйте новую версию Apps Script.</p>':''}`;}
