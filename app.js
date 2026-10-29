@@ -11,29 +11,40 @@ let token=localStorage.getItem('tk_session')||'',person=JSON.parse(localStorage.
 let bridge=null,bridgeOrigin='',ready=false,readyPromise=null,readyResolve=null,pending=new Map(),scanner=null,stream=null,scanBusy=false,lastSelfAt=0,lastCorrections=null;
 let apiUrl=String(localStorage.getItem('tk_api_url')||'').trim();
 let lastInvalidServerScanAt=0;
+let networkCount=0,networkTime=0,networkInterval=null;
+function netStart(action){
+ networkCount++;if(networkCount!==1)return;
+ networkTime=Date.now();
+ let bar=document.querySelector('#netState');
+ if(!bar){bar=document.createElement('div');bar.id='netState';bar.setAttribute('role','status');bar.setAttribute('aria-live','polite');bar.innerHTML='<span class="netCircle" aria-hidden="true"></span><span id="netText"></span>';document.body.appendChild(bar)}
+ bar.hidden=false;document.querySelector('#netText').textContent=action||'Подключаемся…';
+ clearInterval(networkInterval);networkInterval=setInterval(()=>{const t=document.querySelector('#netText');if(t&&Date.now()-networkTime>8500)t.textContent='Сервер отвечает медленно. Ожидаем…'},1300);
+}
+function netEnd(){networkCount=Math.max(0,networkCount-1);if(!networkCount){clearInterval(networkInterval);const b=document.querySelector('#netState');if(b)b.hidden=true}}
+
 
 function toast(text){toaster.innerHTML=`<div class="toast">${esc(text)}</div>`;setTimeout(()=>toaster.innerHTML='',5200)}
 function errorMessage(e){return String(e&&e.message||e||'Ошибка связи')}
-function disconnect(message){ready=false;if(readyResolve){readyResolve(false);readyResolve=null;}for(const [key,job]of pending){clearTimeout(job.timer);job.reject(new Error(message||'Нет связи с сервером'))}pending.clear();}
+function disconnect(message){ready=false;if(readyResolve){readyResolve(false);readyResolve=null;}for(const [key,job]of pending){clearTimeout(job.timer);netEnd();job.reject(new Error(message||'Нет связи с сервером'))}pending.clear();}
 function apiValid(url){return /^https:\/\/script\.google\.com\/macros\/s\/[-\w]+\/exec(?:\?.*)?$/.test(url||'')}
 function initBridge(){if(!apiValid(apiUrl)){ready=false;return Promise.resolve(false)}if(ready)return Promise.resolve(true);if(readyPromise)return readyPromise;
- const nonce=id();const frame=document.createElement('iframe');frame.style.cssText='position:absolute;width:0;height:0;border:0;opacity:0;pointer-events:none';frame.setAttribute('aria-hidden','true');
+ netStart('Соединяемся с Apps Script…');const nonce=id();const frame=document.createElement('iframe');frame.style.cssText='position:absolute;width:0;height:0;border:0;opacity:0;pointer-events:none';frame.setAttribute('aria-hidden','true');
  frame.src=apiUrl.split('?')[0]+'?view=bridge&bridgeNonce='+encodeURIComponent(nonce);
  document.querySelector('#bridgeContainer').replaceChildren(frame);
- readyPromise=new Promise(resolve=>{readyResolve=resolve;const timer=setTimeout(()=>{if(!ready){window.removeEventListener('message',onready);disconnect('Не удалось подключиться к Apps Script. Проверьте URL, доступ «Все» и разрешение встраивания.');readyPromise=null;resolve(false)}},18000);
+ readyPromise=new Promise(resolve=>{readyResolve=resolve;const timer=setTimeout(()=>{if(!ready){window.removeEventListener('message',onready);disconnect('Не удалось подключиться к Apps Script. Проверьте URL, доступ «Все» и разрешение встраивания.');readyPromise=null;netEnd();resolve(false)}},18000);
   const onready=event=>{if(event.data?.type!=='TK_READY'||event.data?.nonce!==nonce)return;
    if(!/^https:\/\/([\w-]+\.)*googleusercontent\.com$/.test(event.origin)&&event.origin!=='https://script.google.com')return;
-   bridge=event.source;bridgeOrigin=event.origin;ready=true;clearTimeout(timer);readyResolve=null;window.removeEventListener('message',onready);resolve(true);
+   bridge=event.source;bridgeOrigin=event.origin;ready=true;clearTimeout(timer);netEnd();readyResolve=null;window.removeEventListener('message',onready);resolve(true);
   };window.addEventListener('message',onready);
  });return readyPromise;
 }
 window.addEventListener('message',event=>{if(!ready||event.source!==bridge||event.origin!==bridgeOrigin||event.data?.type!=='TK_REPLY')return;
- const job=pending.get(event.data.id);if(!job)return;clearTimeout(job.timer);pending.delete(event.data.id);
+ const job=pending.get(event.data.id);if(!job)return;clearTimeout(job.timer);pending.delete(event.data.id);netEnd();
  const response=event.data.response;if(response?.ok)job.resolve(response.data);else job.reject(new Error(response?.error||'Ошибка сервера'));
 });
 async function once(op,args={},requestId=id()){
- const connected=await initBridge();if(!connected)throw new Error('Нет соединения с сервером Apps Script');
- return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(requestId);reject(new Error('Превышено время ответа. Проверьте состояние отметки перед повтором.'))},30000);pending.set(requestId,{resolve,reject,timer});
+ netStart(op==='login'?'Проверяем ID и PIN…':op==='clock'?'Сохраняем отметку…':op==='corrections'?'Загружаем заявки…':op==='self'?'Обновляем график и часы…':'Отправляем запрос…');let connected;try{connected=await initBridge()}catch(e){netEnd();throw e}if(!connected){netEnd();throw new Error('Нет соединения с сервером Apps Script')}
+ return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(requestId);netEnd();reject(new Error('Превышено время ответа. Проверьте состояние отметки перед повтором.'))},30000);pending.set(requestId,{resolve,reject,timer});
   bridge.postMessage({type:'TK_REQUEST',id:requestId,request:{op,args,token,requestId}},bridgeOrigin);
  });
 }
@@ -110,7 +121,7 @@ function homeView(){const online=navigator.onLine;const open=snapshot.open;const
  <p class="small muted" style="margin:18px 3px"><span class="dot ${online?'':'offline'}"></span>${online?'Подключение доступно':'Нет сети — отметка QR недоступна'} · История сохранена на устройстве</p>`;}
 function scheduleView(){return `<div class="section row"><h2>Мой график на 30 дней</h2><button class="link" id="update">↻</button></div><div class="card">${(snapshot.week||[]).map(s=>`<div class="day"><div class="dayDate"><b>${s.date.slice(-2)}</b><span>${new Date(s.date+'T12:00:00').toLocaleDateString('ru-RU',{weekday:'short'})}</span></div><div style="flex:1"><b>${s.work?'Рабочий день':'Выходной'}</b><p class="small muted">${s.work?esc(s.start)+' — '+esc(s.end):'Без смены'}</p></div><span class="chip ${s.work?'':'off'}">${s.work?'Смена':'Выходной'}</span></div>`).join('')||'<div class="empty">График не назначен</div>'}</div>${(snapshot.week||[]).length<30?'<p class="notice" style="margin-top:12px">Для 30 дней обновите серверный Code.gs и опубликуйте новую версию Apps Script.</p>':''}`;}
 function historyView(){return `<div class="section row"><h2>Отработанные смены</h2><button class="link" id="update">↻</button></div><div class="card">${(snapshot.history||[]).map(s=>`<div class="day"><div class="dayDate"><b>${String(s.date).slice(-2)}</b><span>${new Date(s.date+'T12:00:00').toLocaleDateString('ru-RU',{month:'short'})}</span></div><div style="flex:1"><b>${hour(s.in_at)} — ${hour(s.out_at)}</b><p class="small muted">${s.source==='SCAN'?'QR-отметки':'Корректировка'} · ${esc(s.date)}</p></div><b>${hours(s.minutes)}</b></div>`).join('')||'<div class="empty">Закрытых смен пока нет</div>'}</div><p class="small muted" style="padding:13px">Показаны последние 40 дней. Данные обновляются при входе и по кнопке.</p>`;}
-function requestView(){return `<div class="section row"><h2>Корректировки</h2><button class="link" id="update">↻</button></div><div class="card"><p class="muted small">Забыли отметить приход или уход? Подайте заявку — руководитель получит ее на рассмотрение.</p><button class="btn" id="newRequest" style="width:100%;margin-top:15px">+ Новая заявка</button></div><div class="section"><h2>Мои заявки</h2></div><div class="card">${!lastCorrections?'<div class="empty">Загружаем заявки…</div>':lastCorrections.map(r=>`<div class="day"><div style="flex:1"><b>${esc(r.date)}</b><p class="small muted">${esc(r.reason)}</p><p class="small muted">${hour(r.proposed_in)} — ${hour(r.proposed_out)}</p></div><span class="chip ${r.status==='APPROVED'?'':'off'}">${({PENDING:'Ожидает',APPROVED:'Принята',REJECTED:'Отклонена'})[r.status]||r.status}</span></div>`).join('')||'<div class="empty">Заявок пока нет</div>'}</div>`;}
+function requestView(){return `<div class="section row"><h2>Заявки на корректировку</h2><button class="link" id="update">↻</button></div><div class="card"><p class="muted small">Забыли отметить приход или уход? Подайте заявку — руководитель получит её на рассмотрение. Здесь появятся решение и комментарий.</p><button class="btn" id="newRequest" style="width:100%;margin-top:15px">+ Новая заявка</button></div><div class="section"><h2>Мои заявки</h2></div><div class="card">${!lastCorrections?'<div class="loadingLine"><span class="netCircle"></span> Загружаем заявки…</div>':lastCorrections.map(r=>`<div class="day"><div style="flex:1"><b>${esc(r.date)}</b><p class="small muted">${esc(r.reason)}</p><p class="small muted">${r.proposed_in?hour(r.proposed_in)+' — '+hour(r.proposed_out):'Объяснение пропуска'}</p></div><span class="chip ${r.status==='APPROVED'?'':'off'}">${({PENDING:'Ожидает решения',APPROVED:'Принята',REJECTED:'Отклонена'})[r.status]||esc(r.status)}</span></div>${r.status==='REJECTED'?`<div class="decisionNote rejectedNote"><b>Причина отклонения</b><p>${esc(r.comment||'Руководитель не указал комментарий к этой заявке.')}</p>${r.reviewed_at?`<span class="small muted">Рассмотрено: ${new Date(r.reviewed_at).toLocaleDateString('ru-RU')}</span>`:''}</div>`:r.status==='APPROVED'&&r.comment?`<div class="decisionNote"><b>Комментарий руководителя</b><p>${esc(r.comment)}</p></div>`:''}`).join('')||'<div class="empty">Заявок пока нет</div>'}</div>`;}
 async function loadCorrections(){if(!navigator.onLine){toast('Нет сети, заявки не обновлены');return}try{lastCorrections=await call('corrections');if(tab==='requests')drawContent()}catch(e){toast(errorMessage(e))}}
 function newCorrection(){const day=dateLocal();showDialog('Заявка на корректировку',`<form id="correctionForm"><div class="field"><label>Дата смены</label><input type="date" class="input" name="date" value="${day}" required max="${day}"></div><div class="field"><label>Фактический приход</label><input type="datetime-local" class="input" name="start" value="${day}T09:00" required></div><div class="field"><label>Фактический уход</label><input type="datetime-local" class="input" name="end" value="${day}T18:00" required></div><div class="field"><label>Причина (обязательно)</label><textarea name="reason" rows="3" class="input" minlength="5" maxlength="500" placeholder="Например, забыл отсканировать QR при уходе" required></textarea></div><button class="btn" style="width:100%">Отправить заявку</button></form>`);
  $('#correctionForm').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;b.textContent='Отправляем…';const f=Object.fromEntries(new FormData(e.target));try{f.start=new Date(f.start).toISOString();f.end=new Date(f.end).toISOString();await call('correction',f,true);closeDialog();toast('Заявка отправлена');lastCorrections=null;await loadCorrections()}catch(ex){toast(errorMessage(ex));b.disabled=false;b.textContent='Отправить заявку'}};
@@ -148,7 +159,7 @@ async function sendClock(qr){showDialog('Подтверждение',`<div style
 async function boot(){if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
  if(!apiValid(apiUrl)){serverSetupScreen();return}
  if(!person){loginScreen();initBridge();return}
- snapshot=await kvGet('self_'+apiUrl+'_'+person.id);render();await initBridge();if(ready){await refreshSelf(true);render()}else if(!snapshot)toast('Не удалось установить связь с Apps Script. Проверьте настройки сервера.');
+ netStart('Загружаем приложение…');try{snapshot=await kvGet('self_'+apiUrl+'_'+person.id);}finally{netEnd()}render();await initBridge();if(ready){await refreshSelf(true);render()}else if(!snapshot)toast('Не удалось установить связь с Apps Script. Проверьте настройки сервера.');
  window.addEventListener('online',async()=>{await refreshSelf(true);render()});
 }
 boot();
