@@ -9,7 +9,8 @@ const hours=mins=>`${Math.floor(Number(mins||0)/60)} ч ${Math.round(Number(mins
 const $=s=>document.querySelector(s);
 let token=localStorage.getItem('tk_session')||'',person=JSON.parse(localStorage.getItem('tk_user')||'null'),snapshot=null,tab='home';
 let bridge=null,bridgeOrigin='',ready=false,readyPromise=null,readyResolve=null,pending=new Map(),scanner=null,stream=null,scanBusy=false,lastSelfAt=0,lastCorrections=null;
-let apiUrl=String(GAS_WEB_APP_URL||localStorage.getItem('tk_api_url')||'').trim();
+let apiUrl=String(localStorage.getItem('tk_api_url')||'').trim();
+let lastInvalidServerScanAt=0;
 
 function toast(text){toaster.innerHTML=`<div class="toast">${esc(text)}</div>`;setTimeout(()=>toaster.innerHTML='',5200)}
 function errorMessage(e){return String(e&&e.message||e||'Ошибка связи')}
@@ -42,20 +43,58 @@ async function call(op,args={},retryBusy=false){const requestId=id();for(let tri
 const dbPromise=new Promise(resolve=>{if(!window.indexedDB){resolve(null);return}const req=indexedDB.open('timekeeper-cache',1);req.onupgradeneeded=()=>req.result.createObjectStore('kv');req.onsuccess=()=>resolve(req.result);req.onerror=()=>resolve(null)});
 async function kvGet(key){const db=await dbPromise;if(!db)return null;return new Promise(resolve=>{const r=db.transaction('kv','readonly').objectStore('kv').get(key);r.onsuccess=()=>resolve(r.result||null);r.onerror=()=>resolve(null)})}
 async function kvSet(key,value){const db=await dbPromise;if(!db)return;return new Promise(resolve=>{const t=db.transaction('kv','readwrite');t.objectStore('kv').put(value,key);t.oncomplete=resolve;t.onerror=resolve})}
+
+function parseServerUrl(raw){
+ try{
+  const value=String(raw||'').trim().replace(/^TK_SERVER[|:]/i,'').trim();
+  const u=new URL(value);
+  if(u.protocol!=='https:'||u.hostname!=='script.google.com'||u.port||u.username||u.password||
+     !/^\/macros\/s\/[A-Za-z0-9_-]+\/exec\/?$/.test(u.pathname))return '';
+  return u.origin+u.pathname.replace(/\/$/,'');
+ }catch(e){return ''}
+}
+function serverSetupScreen(){
+ app.innerHTML='<div class="login"><div class="logoIcon">◈</div><div><p style="color:#5e77a1;font-weight:750;letter-spacing:2px;font-size:12px">ПЕРВОЕ ПОДКЛЮЧЕНИЕ</p><h1>Подключить сервер</h1><p class="muted" style="margin-top:10px">Отсканируйте QR-код с адресом Google Apps Script. Это требуется только один раз на устройстве.</p></div><button class="btn" id="scanServer">▦ Сканировать QR сервера</button><form id="serverSetupForm"><div class="field"><label>Или вставьте URL сервера вручную</label><input class="input" name="url" type="url" inputmode="url" autocapitalize="off" autocomplete="off" placeholder="https://script.google.com/macros/s/.../exec" required></div><button class="btn outline" style="width:100%">Сохранить адрес</button></form><div class="notice">Адрес сохранится на этом телефоне и не будет запрашиваться при следующем запуске или выходе из аккаунта.</div></div>';
+ $('#scanServer').onclick=()=>startScan('server');
+ $('#serverSetupForm').onsubmit=e=>{e.preventDefault();applyServer(e.target.elements.url.value)};
+}
+function openServerSettings(){
+ showDialog('Подключение к серверу','<p class="muted small" style="margin-bottom:14px">Текущий сервер:</p><p class="small" style="overflow-wrap:anywhere;margin-bottom:18px">'+esc(apiUrl||'Не настроен')+'</p><button class="btn" id="changeServerQr" style="width:100%;margin-bottom:16px">▦ Сканировать QR нового сервера</button><form id="changeServerForm"><div class="field"><label>Или введите URL /exec</label><input class="input" name="url" type="url" inputmode="url" autocapitalize="off" value="'+esc(apiUrl)+'" required></div><button class="btn outline" style="width:100%">Сохранить адрес</button></form><p class="muted small" style="margin-top:13px">При смене сервера потребуется снова войти по ID и PIN.</p>');
+ $('#changeServerQr').onclick=()=>{closeDialog();startScan('server')};
+ $('#changeServerForm').onsubmit=e=>{e.preventDefault();applyServer(e.target.elements.url.value)};
+}
+function applyServer(raw){
+ const next=parseServerUrl(raw);
+ if(!next){toast('Неверный QR: нужен HTTPS-адрес Google Apps Script, оканчивающийся на /exec');return false}
+ const changed=apiUrl!==next;
+ if(changed){
+  disconnect('Адрес сервера изменен');readyPromise=null;bridge=null;bridgeOrigin='';
+  document.querySelector('#bridgeContainer').replaceChildren();
+  logoutLocal();
+ }
+ apiUrl=next;
+ try{localStorage.setItem('tk_api_url',next)}catch(e){toast('Не удалось сохранить адрес на устройстве: проверьте настройки браузера');return false}
+ closeDialog();
+ if(person&&!changed)render();else loginScreen();
+ initBridge();
+ toast('Адрес сервера сохранен. Повторно сканировать QR не нужно.');
+ return true;
+}
+
 function loginScreen(){app.innerHTML=`<div class="login"><div class="logoIcon">◈</div><div><p style="color:#5e77a1;font-weight:750;letter-spacing:2px;font-size:12px">РАБОЧЕЕ ВРЕМЯ</p><h1>TimeKeeper</h1><p class="muted" style="margin-top:10px">Отмечайте начало и конец смены, следите за графиком и часами.</p></div><form id="login"><div class="field"><label>Ваш ID</label><input class="input" name="id" inputmode="numeric" placeholder="Введите ID" required></div><div class="field"><label>PIN-код</label><input class="input" name="pin" type="password" inputmode="numeric" placeholder="••••••" minlength="6" required></div><button class="btn">Войти</button></form><button class="link" id="seturl">⚙ Адрес сервера</button><div class="notice">Для отметки QR необходимо подключение к интернету. Расписание и история доступны из локального кеша.</div></div>`;
  $('#login').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;b.textContent='Проверяем…';try{const r=await call('login',Object.fromEntries(new FormData(e.target)));token=r.token;person=r.user;localStorage.setItem('tk_session',token);localStorage.setItem('tk_user',JSON.stringify(person));lastSelfAt=0;tab='home';await refreshSelf(true);render()}catch(err){toast(errorMessage(err));b.disabled=false;b.textContent='Войти'}};
- $('#seturl').onclick=()=>{showDialog('Адрес сервера',`<form id="urlForm"><div class="field"><label>Google Apps Script /exec URL</label><input class="input" name="url" value="${esc(apiUrl)}" placeholder="https://script.google.com/macros/s/.../exec" required></div><button class="btn" style="width:100%">Сохранить</button></form>`);$('#urlForm').onsubmit=e=>{e.preventDefault();const next=e.target.elements.url.value.trim();if(!apiValid(next)){toast('Укажите адрес опубликованного Web App, оканчивающийся на /exec');return}apiUrl=next;localStorage.setItem('tk_api_url',next);ready=false;readyPromise=null;closeDialog();toast('Адрес сохранен')}};
+ $('#seturl').onclick=openServerSettings;
 }
 function showDialog(title,body){dialog.innerHTML=`<div class="overlay" id="backdrop"><div class="dialog"><div class="row" style="margin-bottom:20px"><h2>${esc(title)}</h2><button class="link" id="dismiss">Закрыть</button></div>${body}</div></div>`;$('#dismiss').onclick=closeDialog;$('#backdrop').onclick=e=>{if(e.target.id==='backdrop')closeDialog()}}
 function closeDialog(){dialog.innerHTML=''}
 async function refreshSelf(force=false){if(!person)return;if(!force&&snapshot&&Date.now()-lastSelfAt<10*60000)return;
- if(!navigator.onLine){if(!snapshot)snapshot=await kvGet('self_'+person.id);return}
- try{const incoming=await call('self');snapshot=incoming;lastSelfAt=Date.now();await kvSet('self_'+person.id,incoming)}catch(e){if(!snapshot)snapshot=await kvGet('self_'+person.id);if(/Сессия|вход|учетная запись/i.test(errorMessage(e))){logoutLocal();toast('Войдите снова');return;}toast('Работаем с сохраненными данными: '+errorMessage(e))}
+ if(!navigator.onLine){if(!snapshot)snapshot=await kvGet('self_'+apiUrl+'_'+person.id);return}
+ try{const incoming=await call('self');snapshot=incoming;lastSelfAt=Date.now();await kvSet('self_'+apiUrl+'_'+person.id,incoming)}catch(e){if(!snapshot)snapshot=await kvGet('self_'+apiUrl+'_'+person.id);if(/Сессия|вход|учетная запись/i.test(errorMessage(e))){logoutLocal();toast('Войдите снова');return;}toast('Работаем с сохраненными данными: '+errorMessage(e))}
 }
 function render(){if(!person){loginScreen();return}const initials=person.fio.trim().split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase();
  app.innerHTML=`<div class="app"><header class="head"><div class="top"><div><p class="small">УЧЕТ РАБОЧЕГО ВРЕМЕНИ</p><b style="font-size:18px">TimeKeeper</b></div><button class="avatar" id="profile" style="color:white;border:0">${esc(initials)}</button></div><p class="small">Здравствуйте,</p><h1>${esc(person.fio)}</h1></header><main class="main"><div id="content"></div></main><nav class="tabbar">${[['home','⌂','Главная'],['schedule','▦','График'],['history','◷','История'],['requests','✎','Заявки']].map(([t,icon,txt])=>`<button data-tab="${t}" class="${t===tab?'active':''}"><span class="sym">${icon}</span>${txt}</button>`).join('')}</nav></div>`;
- $('#profile').onclick=()=>showDialog('Профиль',`<p><b>${esc(person.fio)}</b></p><p class="muted small">ID: ${esc(person.id)}</p><div style="margin-top:20px"><button class="btn outline" id="logout" style="width:100%">Выйти из приложения</button></div>`); // attach after dialog creation
- $('#profile').addEventListener('click',()=>{$('#logout').onclick=async()=>{try{await call('logout')}catch(e){}logoutLocal();closeDialog();loginScreen()}});
+ $('#profile').onclick=()=>showDialog('Профиль',`<p><b>${esc(person.fio)}</b></p><p class="muted small">ID: ${esc(person.id)}</p><div style="margin-top:20px"><button class="btn ghost" id="changeServer" style="width:100%;margin-bottom:10px">⚙ Сменить сервер</button><button class="btn outline" id="logout" style="width:100%">Выйти из приложения</button></div>`); // attach after dialog creation
+ $('#profile').addEventListener('click',()=>{$('#changeServer').onclick=()=>{closeDialog();openServerSettings()};$('#logout').onclick=async()=>{try{await call('logout')}catch(e){}logoutLocal();closeDialog();loginScreen()}});
  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=async()=>{tab=b.dataset.tab;render();if(tab==='requests'&&!lastCorrections)await loadCorrections()});drawContent();
 }
 function logoutLocal(){person=null;token='';snapshot=null;lastCorrections=null;lastSelfAt=0;localStorage.removeItem('tk_session');localStorage.removeItem('tk_user')}
@@ -79,9 +118,9 @@ let qrLibraryPromise=null;
 function loadQrLibrary(){if(typeof window.jsQR==='function')return Promise.resolve();if(qrLibraryPromise)return qrLibraryPromise;
  qrLibraryPromise=new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js';script.onload=()=>typeof window.jsQR==='function'?resolve():reject(new Error('Библиотека QR недоступна'));script.onerror=()=>reject(new Error('Не загрузилась библиотека QR-сканирования'));document.head.append(script)});return qrLibraryPromise;
 }
-async function startScan(){if(!navigator.onLine){toast('Для сканирования требуется сеть');return}if(scanBusy)return;
+async function startScan(mode='clock'){const serverMode=mode==='server';if(!serverMode&&!navigator.onLine){toast('Для сканирования требуется сеть');return}if(scanBusy||scanner)return;
  try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});}catch(e){toast('Доступ к камере не получен. Разрешите использование камеры в браузере.');return}
- document.body.insertAdjacentHTML('beforeend',`<div class="viewer" id="scanner"><div class="viewbar"><b style="font-size:19px">Сканирование QR</b><button class="btn outline" id="stopScan">Закрыть</button></div><p style="color:#b0c6e2;text-align:center">Наведите камеру на QR-код рабочего места</p><video autoplay muted playsinline id="video"></video><div class="notice" style="background:#293b55;color:#c7dcfb">После сканирования дождитесь подтверждения записи на сервере.</div></div>`);
+ document.body.insertAdjacentHTML('beforeend',`<div class="viewer" id="scanner"><div class="viewbar"><b style="font-size:19px">Сканирование QR</b><button class="btn outline" id="stopScan">Закрыть</button></div><p style="color:#b0c6e2;text-align:center">${serverMode?'Наведите камеру на QR-код с URL сервера':'Наведите камеру на QR-код рабочего места'}</p><video autoplay muted playsinline id="video"></video><div class="notice" style="background:#293b55;color:#c7dcfb">${serverMode?'В QR должен быть адрес опубликованного Google Apps Script /exec.':'После сканирования дождитесь подтверждения записи на сервере.'}</div></div>`);
  $('#stopScan').onclick=stopScan;const video=$('#video');video.srcObject=stream;try{await video.play()}catch(e){stopScan();toast('Не удалось запустить камеру');return}
  const canvas=document.createElement('canvas'),ctx=canvas.getContext('2d',{willReadFrequently:true});let detector=null;
  if(window.BarcodeDetector){try{detector=new BarcodeDetector({formats:['qr_code']})}catch(e){}}
@@ -90,7 +129,13 @@ async function startScan(){if(!navigator.onLine){toast('Для сканиров�
  scanner=setInterval(async()=>{if(iterating||!document.querySelector('#scanner')||video.readyState<2||scanBusy)return;iterating=true;
  try{let code='';if(detector){try{const found=await detector.detect(video);code=found[0]?.rawValue||'';}catch(e){detector=null;try{await loadQrLibrary()}catch(ex){stopScan();toast(errorMessage(ex));return}}}else{
  const ratio=Math.min(1,900/video.videoWidth);canvas.width=Math.floor(video.videoWidth*ratio);canvas.height=Math.floor(video.videoHeight*ratio);ctx.drawImage(video,0,0,canvas.width,canvas.height);const img=ctx.getImageData(0,0,canvas.width,canvas.height);code=window.jsQR(img.data,canvas.width,canvas.height,{inversionAttempts:'dontInvert'})?.data||'';}
- if(code&&(code.startsWith('AT1|')||code.startsWith('AT0|'))){scanBusy=true;stopScan();await sendClock(code);}}
+ if(code){
+  if(serverMode){
+   const url=parseServerUrl(code);
+   if(url){scanBusy=true;stopScan();applyServer(url);scanBusy=false}
+   else if(Date.now()-lastInvalidServerScanAt>4500){lastInvalidServerScanAt=Date.now();toast('Это не QR сервера. Отсканируйте код с адресом Apps Script /exec.')}
+  }else if(code.startsWith('AT1|')||code.startsWith('AT0|')){scanBusy=true;stopScan();await sendClock(code)}
+ }}
  catch(e){}finally{iterating=false}},260);
 }
 function stopScan(){if(scanner){clearInterval(scanner);scanner=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}$('#scanner')?.remove()}
@@ -100,8 +145,9 @@ async function sendClock(qr){showDialog('Подтверждение',`<div style
  finally{scanBusy=false}
 }
 async function boot(){if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
+ if(!apiValid(apiUrl)){serverSetupScreen();return}
  if(!person){loginScreen();initBridge();return}
- snapshot=await kvGet('self_'+person.id);render();await initBridge();if(ready){await refreshSelf(true);render()}else if(!snapshot)toast('Не удалось установить связь с Apps Script. Проверьте настройки сервера.');
+ snapshot=await kvGet('self_'+apiUrl+'_'+person.id);render();await initBridge();if(ready){await refreshSelf(true);render()}else if(!snapshot)toast('Не удалось установить связь с Apps Script. Проверьте настройки сервера.');
  window.addEventListener('online',async()=>{await refreshSelf(true);render()});
 }
 boot();
