@@ -25,27 +25,60 @@ function netEnd(){networkCount=Math.max(0,networkCount-1);if(!networkCount){clea
 
 function toast(text){toaster.innerHTML=`<div class="toast">${esc(text)}</div>`;setTimeout(()=>toaster.innerHTML='',5200)}
 function errorMessage(e){return String(e&&e.message||e||'Ошибка связи')}
-function disconnect(message){ready=false;if(readyResolve){readyResolve(false);readyResolve=null;}for(const [key,job]of pending){clearTimeout(job.timer);netEnd();job.reject(new Error(message||'Нет связи с сервером'))}pending.clear();}
+/* Mobile browsers may unload the Apps Script iframe; stale handshakes must never be reused. */
+let bridgeGeneration=0,cancelHandshake=null;
+function disconnect(message){
+ if(cancelHandshake)cancelHandshake();
+ bridgeGeneration++;
+ ready=false;readyPromise=null;readyResolve=null;bridge=null;bridgeOrigin='';
+ const holder=document.querySelector('#bridgeContainer');if(holder)holder.replaceChildren();
+ for(const [key,job]of pending){clearTimeout(job.timer);netEnd();job.reject(new Error(message||'Соединение потеряно'))}
+ pending.clear();
+}
 function apiValid(url){return /^https:\/\/script\.google\.com\/macros\/s\/[-\w]+\/exec(?:\?.*)?$/.test(url||'')}
-function initBridge(){if(!apiValid(apiUrl)){ready=false;return Promise.resolve(false)}if(ready)return Promise.resolve(true);if(readyPromise)return readyPromise;
- netStart('Соединяемся с Apps Script…');const nonce=id();const frame=document.createElement('iframe');frame.style.cssText='position:absolute;width:0;height:0;border:0;opacity:0;pointer-events:none';frame.setAttribute('aria-hidden','true');
+function initBridge(){
+ if(!apiValid(apiUrl))return Promise.resolve(false);
+ const holder=document.querySelector('#bridgeContainer');
+ if(ready&&bridge&&holder?.firstElementChild?.contentWindow===bridge)return Promise.resolve(true);
+ if(readyPromise)return readyPromise;
+ netStart('Соединяемся с Apps Script…');
+ const gen=++bridgeGeneration,nonce=id(),frame=document.createElement('iframe');
+ frame.style.cssText='position:absolute;width:0;height:0;border:0;opacity:0;pointer-events:none';
+ frame.setAttribute('aria-hidden','true');
  frame.src=apiUrl.split('?')[0]+'?view=bridge&bridgeNonce='+encodeURIComponent(nonce);
- document.querySelector('#bridgeContainer').replaceChildren(frame);
- readyPromise=new Promise(resolve=>{readyResolve=resolve;const timer=setTimeout(()=>{if(!ready){window.removeEventListener('message',onready);disconnect('Не удалось подключиться к Apps Script. Проверьте URL, доступ «Все» и разрешение встраивания.');readyPromise=null;netEnd();resolve(false)}},18000);
-  const onready=event=>{if(event.data?.type!=='TK_READY'||event.data?.nonce!==nonce)return;
+ readyPromise=new Promise(resolve=>{
+  let settled=false;
+  function finish(ok){
+   if(settled)return;settled=true;clearTimeout(timer);
+   window.removeEventListener('message',onready);frame.removeEventListener('error',onerror);
+   if(cancelHandshake===cancel)cancelHandshake=null;
+   if(readyResolve===finish)readyResolve=null;
+   if(gen===bridgeGeneration)readyPromise=null;
+   netEnd();resolve(ok);
+  }
+  const cancel=()=>finish(false);
+  const onready=event=>{
+   if(gen!==bridgeGeneration||event.source!==frame.contentWindow)return;
+   if(event.data?.type!=='TK_READY'||event.data?.nonce!==nonce)return;
    if(!/^https:\/\/([\w-]+\.)*googleusercontent\.com$/.test(event.origin)&&event.origin!=='https://script.google.com')return;
-   bridge=event.source;bridgeOrigin=event.origin;ready=true;clearTimeout(timer);netEnd();readyResolve=null;window.removeEventListener('message',onready);resolve(true);
-  };window.addEventListener('message',onready);
- });return readyPromise;
+   bridge=event.source;bridgeOrigin=event.origin;ready=true;finish(true);
+  };
+  const onerror=()=>{if(gen!==bridgeGeneration)return;ready=false;frame.remove();finish(false)};
+  const timer=setTimeout(()=>{if(gen!==bridgeGeneration)return;ready=false;frame.remove();finish(false)},18000);
+  cancelHandshake=cancel;readyResolve=finish;
+  window.addEventListener('message',onready);frame.addEventListener('error',onerror);
+  holder.replaceChildren(frame);
+ });
+ return readyPromise;
 }
 window.addEventListener('message',event=>{if(!ready||event.source!==bridge||event.origin!==bridgeOrigin||event.data?.type!=='TK_REPLY')return;
  const job=pending.get(event.data.id);if(!job)return;clearTimeout(job.timer);pending.delete(event.data.id);netEnd();
- const response=event.data.response;if(response?.ok)job.resolve(response.data);else job.reject(new Error(response?.error||'Ошибка сервера'));
+ const response=event.data.response;if(response?.ok)job.resolve(response.data);else{const message=response?.error||'Ошибка сервера';if(/NetworkError|HTTP\s*0|Нет соединения с сервером|Ошибка подключения/i.test(message))disconnect('Связь с сервером прервана. Проверьте состояние отметки перед повторным сканированием.');job.reject(new Error(message));}
 });
 async function once(op,args={},requestId=id()){
  netStart(op==='login'?'Проверяем ID и PIN…':op==='clock'?'Сохраняем отметку…':op==='corrections'?'Загружаем заявки…':op==='self'?'Обновляем график и часы…':'Отправляем запрос…');let connected;try{connected=await initBridge()}catch(e){netEnd();throw e}if(!connected){netEnd();throw new Error('Нет соединения с сервером Apps Script')}
- return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(requestId);netEnd();reject(new Error('Превышено время ответа. Проверьте состояние отметки перед повтором.'))},30000);pending.set(requestId,{resolve,reject,timer});
-  bridge.postMessage({type:'TK_REQUEST',id:requestId,request:{op,args,token,requestId}},bridgeOrigin);
+ return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{if(pending.has(requestId))disconnect('Нет ответа от сервера за 30 секунд. Отметка могла сохраниться: проверьте статус смены перед повтором.');},30000);pending.set(requestId,{resolve,reject,timer});
+  try{bridge.postMessage({type:'TK_REQUEST',id:requestId,request:{op,args,token,requestId}},bridgeOrigin)}catch(e){disconnect('Не удалось отправить запрос в Apps Script.');}
  });
 }
 async function call(op,args={},retryBusy=false){const requestId=id();for(let tries=0;tries<(retryBusy?3:1);tries++){
@@ -180,13 +213,13 @@ async function startScan(mode='clock'){const serverMode=mode==='server';if(!serv
 function stopScan(){if(scanner){clearInterval(scanner);scanner=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}$('#scanner')?.remove()}
 async function sendClock(qr){showDialog('Подтверждение',`<div style="text-align:center;padding:18px"><div style="font-size:45px;margin-bottom:12px">◷</div><h2>Сохраняем отметку…</h2><p class="muted small" style="margin-top:10px">Не закрывайте приложение до ответа сервера.</p></div>`);
  try{const result=await call('clock',{qr},true);closeDialog();showDialog(result.kind==='IN'?'Приход зафиксирован':result.kind==='OUT'?'Уход зафиксирован':result.kind==='AUTO_PENDING'?'Предыдущая смена требует проверки':'Отметка уже учтена',`<div style="text-align:center;padding:18px"><div style="font-size:60px;color:${result.kind==='AUTO_PENDING'?'#c37b10':'#149366'}">${result.kind==='AUTO_PENDING'?'!':'✓'}</div><h1>${esc(result.time||'Готово')}</h1><p class="muted" style="margin-top:12px">${esc(result.message||'Отметка сохранена')}</p>${result.kind==='AUTO_PENDING'?'<button class="btn ghost" id="requestOvertime" style="margin-top:20px;width:100%">Указать фактическое время ухода</button>':''}<button class="btn" id="ack" style="margin-top:12px;width:100%">Продолжить</button></div>`);$('#ack').onclick=closeDialog;if(result.kind==='AUTO_PENDING')$('#requestOvertime').onclick=()=>{closeDialog();newCorrection(result.date,result.in_at)};await refreshSelf(true);render();}
- catch(e){closeDialog();showDialog('Не удалось подтвердить',`<p>${esc(errorMessage(e))}</p><p class="muted small" style="margin-top:10px">Проверьте историю или статус смены перед новым сканированием, чтобы не сделать лишнюю отметку.</p><button class="btn" style="width:100%;margin-top:20px" id="retryClose">Понятно</button>`);$('#retryClose').onclick=async()=>{closeDialog();await refreshSelf(true);render()}}
+ catch(e){closeDialog();showDialog('Не удалось подтвердить',`<p>${esc(errorMessage(e))}</p><p class="muted small" style="margin-top:10px">Отметка могла сохраниться, даже если подтверждение не дошло. Сначала проверьте статус смены и историю — не сканируйте QR повторно вслепую.</p><button class="btn" style="width:100%;margin-top:20px" id="retryClose">Понятно</button>`);$('#retryClose').onclick=async()=>{closeDialog();await refreshSelf(true);render()}}
  finally{scanBusy=false}
 }
 async function boot(){if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
  if(!apiValid(apiUrl)){serverSetupScreen();return}
  if(!person){loginScreen();initBridge();return}
  netStart('Загружаем приложение…');try{snapshot=await kvGet('self_'+apiUrl+'_'+person.id);}finally{netEnd()}render();await initBridge();if(ready){await refreshSelf(true);render()}else if(!snapshot)toast('Не удалось установить связь с Apps Script. Проверьте настройки сервера.');
- window.addEventListener('online',async()=>{await refreshSelf(true);render()});
+ window.addEventListener('online',async()=>{disconnect('Соединение обновлено после восстановления сети');if(await initBridge()){await refreshSelf(true);render();}});
 }
 boot();
